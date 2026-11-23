@@ -135,8 +135,10 @@ extern "C" int llama_rs_fit_params(
     uint32_t n_ctx_min,
     const void * extra,
     enum ggml_log_level log_level) {
+    // llama.cpp >= 2026-11 takes the list of model paths (split or multi-model fits).
+    const std::vector<std::string> paths_model{std::string(path_model != nullptr ? path_model : "")};
     return static_cast<int>(common_fit_params(
-        path_model,
+        paths_model,
         mparams,
         cparams,
         tensor_split,
