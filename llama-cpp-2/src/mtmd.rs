@@ -66,6 +66,7 @@ impl From<llama_cpp_sys_2::mtmd_input_chunk_type> for MtmdInputChunkType {
 ///     media_marker: CString::new(mtmd_default_marker()).unwrap(),
 ///     image_min_tokens: -1,
 ///     image_max_tokens: -1,
+///     ..MtmdContextParams::default()
 /// };
 /// ```
 #[derive(Debug, Clone)]
@@ -78,6 +79,10 @@ pub struct MtmdContextParams {
     pub n_threads: i32,
     /// Media marker string used to identify media positions in text
     pub media_marker: CString,
+    /// Flash attention policy for the multimodal encoder
+    pub flash_attn_type: llama_cpp_sys_2::llama_flash_attn_type,
+    /// Whether to run a warmup encode pass during initialization
+    pub warmup: bool,
     /// Minimum number of tokens used to represent an image.
     /// Controls the visual token budget lower bound. Use -1 for the model default.
     /// Gemma 4 supported budgets: 70, 140, 280, 560, 1120.
@@ -87,6 +92,8 @@ pub struct MtmdContextParams {
     /// Lower values reduce memory and compute at the cost of visual detail.
     /// Gemma 4 supported budgets: 70, 140, 280, 560, 1120.
     pub image_max_tokens: i32,
+    /// Maximum number of output tokens in one `MtmdBatch` encode pass (default: 1024).
+    pub batch_max_tokens: i32,
 }
 
 impl Default for MtmdContextParams {
@@ -103,16 +110,22 @@ impl From<&MtmdContextParams> for llama_cpp_sys_2::mtmd_context_params {
             print_timings,
             n_threads,
             media_marker,
+            flash_attn_type,
+            warmup,
             image_min_tokens,
             image_max_tokens,
+            batch_max_tokens,
         } = params;
 
         context.use_gpu = *use_gpu;
         context.print_timings = *print_timings;
         context.n_threads = *n_threads;
         context.media_marker = media_marker.as_ptr();
+        context.flash_attn_type = *flash_attn_type;
+        context.warmup = *warmup;
         context.image_min_tokens = *image_min_tokens;
         context.image_max_tokens = *image_max_tokens;
+        context.batch_max_tokens = *batch_max_tokens;
 
         context
     }
@@ -125,10 +138,38 @@ impl From<llama_cpp_sys_2::mtmd_context_params> for MtmdContextParams {
             print_timings: params.print_timings,
             n_threads: params.n_threads,
             media_marker: unsafe { CStr::from_ptr(params.media_marker) }.to_owned(),
+            flash_attn_type: params.flash_attn_type,
+            warmup: params.warmup,
             image_min_tokens: params.image_min_tokens,
             image_max_tokens: params.image_max_tokens,
+            batch_max_tokens: params.batch_max_tokens,
         }
     }
+}
+
+/// Capabilities reported by an `mmproj` file without initializing the full context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MtmdCaps {
+    /// Whether the projector supports vision input.
+    pub inp_vision: bool,
+    /// Whether the projector supports audio input.
+    pub inp_audio: bool,
+    /// Whether the projector supports audio generation.
+    pub gen_audio: bool,
+}
+
+/// Inspects `mmproj_path` capabilities without loading weights into a full context.
+///
+/// # Errors
+/// Returns `MtmdInitError::CStringError` when `mmproj_path` contains a NUL byte.
+pub fn mtmd_get_cap_from_file(mmproj_path: &str) -> Result<MtmdCaps, MtmdInitError> {
+    let path_cstr = CString::new(mmproj_path)?;
+    let caps = unsafe { llama_cpp_sys_2::mtmd_get_cap_from_file(path_cstr.as_ptr()) };
+    Ok(MtmdCaps {
+        inp_vision: caps.inp_vision,
+        inp_audio: caps.inp_audio,
+        gen_audio: caps.gen_audio,
+    })
 }
 
 /// Text input configuration
@@ -154,13 +195,63 @@ pub struct MtmdInputText {
     pub parse_special: bool,
 }
 
+/// Boxed cancellation predicate retained for the lifetime of an [`MtmdContext`].
+struct EvalAbortState {
+    should_abort: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+unsafe extern "C" fn mtmd_progress_trampoline<F>(
+    progress: f32,
+    user_data: *mut std::ffi::c_void,
+) -> bool
+where
+    F: FnMut(f32) -> bool,
+{
+    if user_data.is_null() {
+        return true;
+    }
+    let callback = &mut *user_data.cast::<F>();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(progress))).unwrap_or(false)
+}
+
+unsafe extern "C" fn mtmd_eval_abort_trampoline(
+    _tensor: *mut llama_cpp_sys_2::ggml_tensor,
+    ask: bool,
+    user_data: *mut std::ffi::c_void,
+) -> bool {
+    if user_data.is_null() {
+        return !ask;
+    }
+    let state = &*user_data.cast::<EvalAbortState>();
+    let aborted =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (state.should_abort)()))
+            .unwrap_or(true);
+    if ask {
+        // Return `false` while running so the scheduler batches nodes at full speed; return
+        // `true` once cancelled so the scheduler invokes us with `ask == false` to cancel.
+        aborted
+    } else {
+        !aborted
+    }
+}
+
 /// Safe wrapper around `mtmd_context`.
 ///
 /// This represents an initialized multimodal context that can process
 /// text, images, and audio through llama.cpp's multimodal interface.
-#[derive(Debug)]
 pub struct MtmdContext {
     context: Ptr<llama_cpp_sys_2::mtmd_context>,
+    // Retained until after `mtmd_free` runs in `Drop` because `mtmd_backends` holds its raw pointer.
+    _eval_abort: Option<Box<EvalAbortState>>,
+}
+
+impl std::fmt::Debug for MtmdContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MtmdContext")
+            .field("context", &self.context)
+            .field("has_eval_abort", &self._eval_abort.is_some())
+            .finish()
+    }
 }
 
 // SAFETY: `mtmd_context` tokenization is thread safe.
@@ -208,7 +299,61 @@ impl MtmdContext {
         };
 
         let context = Ptr::new(context).ok_or(MtmdInitError::NullResult)?;
-        Ok(Self { context })
+        Ok(Self {
+            context,
+            _eval_abort: None,
+        })
+    }
+
+    /// Initialize MTMD context with optional load-progress and encode-cancellation callbacks.
+    ///
+    /// `progress_callback` receives progress in `[0.0, 1.0]` during `mtmd_init_from_file` and
+    /// aborts loading when it returns `false`. `should_abort_eval` is queried during vision graph
+    /// evaluation and cancels encoding when it returns `true`.
+    ///
+    /// # Errors
+    /// Returns `MtmdInitError::CStringError` if `mmproj_path` contains a NUL byte, or
+    /// `MtmdInitError::NullResult` if initialization fails or is aborted.
+    pub fn init_from_file_with_callbacks<P, A>(
+        mmproj_path: &str,
+        text_model: &LlamaModel,
+        params: &MtmdContextParams,
+        mut progress_callback: Option<P>,
+        should_abort_eval: Option<A>,
+    ) -> Result<Self, MtmdInitError>
+    where
+        P: FnMut(f32) -> bool,
+        A: Fn() -> bool + Send + Sync + 'static,
+    {
+        let path_cstr = CString::new(mmproj_path)?;
+        let mut ctx_params = llama_cpp_sys_2::mtmd_context_params::from(params);
+        if let Some(callback) = progress_callback.as_mut() {
+            ctx_params.progress_callback = Some(mtmd_progress_trampoline::<P>);
+            ctx_params.progress_callback_user_data = std::ptr::from_mut(callback).cast();
+        }
+        let mut eval_abort = should_abort_eval.map(|should_abort| {
+            Box::new(EvalAbortState {
+                should_abort: Box::new(should_abort),
+            })
+        });
+        if let Some(state) = eval_abort.as_mut() {
+            ctx_params.cb_eval = Some(mtmd_eval_abort_trampoline);
+            ctx_params.cb_eval_user_data = std::ptr::from_mut(state.as_mut()).cast();
+        }
+
+        let context = unsafe {
+            llama_cpp_sys_2::mtmd_init_from_file(
+                path_cstr.as_ptr(),
+                text_model.model.as_ptr(),
+                ctx_params,
+            )
+        };
+
+        let context = Ptr::new(context).ok_or(MtmdInitError::NullResult)?;
+        Ok(Self {
+            context,
+            _eval_abort: eval_abort,
+        })
     }
 
     /// Check whether non-causal attention mask is needed before `llama_decode`.
@@ -906,6 +1051,41 @@ impl MtmdInputChunk<'_> {
         }
     }
 
+    /// Evaluate this single chunk (text, image, or audio) and return the updated `n_past`.
+    ///
+    /// Calling this chunk by chunk allows checking cancellation between chunks.
+    ///
+    /// # Errors
+    /// Returns `MtmdEvalError::EvalFailure` if encoding or decoding fails.
+    pub fn eval_single(
+        &self,
+        mtmd_ctx: &mut MtmdContext,
+        llama_ctx: &mut LlamaContext,
+        n_past: llama_cpp_sys_2::llama_pos,
+        seq_id: llama_cpp_sys_2::llama_seq_id,
+        n_batch: i32,
+        logits_last: bool,
+    ) -> Result<llama_cpp_sys_2::llama_pos, MtmdEvalError> {
+        let mut new_n_past: llama_cpp_sys_2::llama_pos = n_past;
+        let result = unsafe {
+            llama_cpp_sys_2::mtmd_helper_eval_chunk_single(
+                mtmd_ctx.context.as_mut_ptr(),
+                llama_ctx.context.as_mut_ptr(),
+                self.chunk.as_ptr(),
+                n_past,
+                seq_id,
+                n_batch,
+                logits_last,
+                &raw mut new_n_past,
+            )
+        };
+        if result == 0 {
+            Ok(new_n_past)
+        } else {
+            Err(MtmdEvalError::EvalFailure(result))
+        }
+    }
+
     /// Create a copy of this chunk that you own.
     ///
     /// This is useful if you want to use custom logic to handle the chunk
@@ -938,6 +1118,117 @@ impl Drop for MtmdInputChunk<'_> {
         if self.owned {
             unsafe { llama_cpp_sys_2::mtmd_input_chunk_free(self.chunk.as_mut_ptr()) }
         }
+    }
+}
+
+/// Outcome of attempting to add a media chunk to an [`MtmdBatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtmdBatchAddOutcome {
+    /// Chunk was added to the batch.
+    Added,
+    /// Batch token limit was reached or the model does not support multi-chunk batching.
+    BatchFull,
+    /// Chunk shape or modality cannot be batched with the existing entries.
+    Incompatible,
+}
+
+/// Safe wrapper around `mtmd_batch` for encoding one or more compatible media chunks together.
+#[derive(Debug)]
+pub struct MtmdBatch<'ctx> {
+    batch: Ptr<llama_cpp_sys_2::mtmd_batch>,
+    ctx: &'ctx mut MtmdContext,
+}
+
+impl<'ctx> MtmdBatch<'ctx> {
+    /// Initializes an empty media batch bound to `ctx`.
+    ///
+    /// # Errors
+    /// Returns `MtmdEncodeError::EncodeFailure` if native allocation returns null.
+    pub fn new(ctx: &'ctx mut MtmdContext) -> Result<Self, MtmdEncodeError> {
+        let batch = unsafe { llama_cpp_sys_2::mtmd_batch_init(ctx.context.as_mut_ptr()) };
+        let batch = Ptr::new(batch).ok_or(MtmdEncodeError::EncodeFailure(1))?;
+        Ok(Self { batch, ctx })
+    }
+
+    /// Adds a media chunk to this batch. The caller must keep `chunk` alive until encoding finishes.
+    ///
+    /// # Errors
+    /// Returns `MtmdEncodeError::EncodeFailure` on invalid (e.g. text) chunks.
+    pub fn add_chunk(
+        &mut self,
+        chunk: &MtmdInputChunk<'_>,
+    ) -> Result<MtmdBatchAddOutcome, MtmdEncodeError> {
+        let res = unsafe {
+            llama_cpp_sys_2::mtmd_batch_add_chunk(self.batch.as_mut_ptr(), chunk.chunk.as_ptr())
+        };
+        match res {
+            0 => Ok(MtmdBatchAddOutcome::Added),
+            2 => Ok(MtmdBatchAddOutcome::BatchFull),
+            3 => Ok(MtmdBatchAddOutcome::Incompatible),
+            other => Err(MtmdEncodeError::EncodeFailure(other)),
+        }
+    }
+
+    /// Encodes all chunks currently stored in this batch.
+    ///
+    /// # Errors
+    /// Returns `MtmdEncodeError::EncodeFailure` if native encoding fails.
+    pub fn encode(&mut self) -> Result<(), MtmdEncodeError> {
+        let res = unsafe { llama_cpp_sys_2::mtmd_batch_encode(self.batch.as_mut_ptr()) };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(MtmdEncodeError::EncodeFailure(res))
+        }
+    }
+
+    /// Decodes a previously batch-encoded image chunk into `llama_ctx` and returns the new `n_past`.
+    ///
+    /// # Errors
+    /// Returns `MtmdEvalError::EvalFailure` if embeddings are missing or decoding fails.
+    pub fn decode_image_chunk(
+        &mut self,
+        llama_ctx: &mut LlamaContext,
+        chunk: &MtmdInputChunk<'_>,
+        n_past: llama_cpp_sys_2::llama_pos,
+        seq_id: llama_cpp_sys_2::llama_seq_id,
+        n_batch: i32,
+    ) -> Result<llama_cpp_sys_2::llama_pos, MtmdEvalError> {
+        let embd = unsafe {
+            llama_cpp_sys_2::mtmd_batch_get_output_embd(
+                self.batch.as_mut_ptr(),
+                chunk.chunk.as_ptr(),
+            )
+        };
+        if embd.is_null() {
+            return Err(MtmdEvalError::EvalFailure(-1));
+        }
+        let mut new_n_past: llama_cpp_sys_2::llama_pos = n_past;
+        let res = unsafe {
+            llama_cpp_sys_2::mtmd_helper_decode_image_chunk(
+                self.ctx.context.as_mut_ptr(),
+                llama_ctx.context.as_mut_ptr(),
+                chunk.chunk.as_ptr(),
+                embd,
+                n_past,
+                seq_id,
+                n_batch,
+                &raw mut new_n_past,
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        if res == 0 {
+            Ok(new_n_past)
+        } else {
+            Err(MtmdEvalError::EvalFailure(res))
+        }
+    }
+}
+
+impl Drop for MtmdBatch<'_> {
+    fn drop(&mut self) {
+        unsafe { llama_cpp_sys_2::mtmd_batch_free(self.batch.as_mut_ptr()) }
     }
 }
 

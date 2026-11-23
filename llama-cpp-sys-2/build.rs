@@ -995,6 +995,9 @@ fn main() {
 
     if cfg!(feature = "mtmd") {
         config.define("LLAMA_BUILD_MTMD", "ON");
+        // Disable ffmpeg subprocess video decoding so mtmd builds identically on desktop and
+        // mobile targets (iOS, iPadOS, Android, macOS, Windows, Linux) without external binaries.
+        config.define("MTMD_VIDEO", "OFF");
     }
 
     if cfg!(feature = "system-ggml") {
@@ -1180,19 +1183,35 @@ fn main() {
             .join("vendor")
             .join("hash")
             .join("**");
-        let vendor_hash_libs = extract_lib_names(&dir, &target_os, false);
-        assert_eq!(
-            vendor_hash_libs.len(),
-            1,
-            "unknown vendor-hash archive found in {dir:?}: {vendor_hash_libs:?}",
-        );
-
-        let lib = &vendor_hash_libs[0];
+        let mut vendor_hash_libs = extract_lib_names(&dir, &target_os, false);
+        if vendor_hash_libs.is_empty() {
+            vendor_hash_libs = extract_lib_names(&out_dir.join("lib*"), &target_os, false)
+                .into_iter()
+                .filter(|path| lib_name(path).contains("hash"))
+                .collect();
+        }
+        let selected = if vendor_hash_libs.len() > 1 {
+            vendor_hash_libs
+                .iter()
+                .find(|path| {
+                    path.parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&profile))
+                })
+                .or_else(|| vendor_hash_libs.first())
+                .cloned()
+        } else {
+            vendor_hash_libs.into_iter().next()
+        };
+        let lib = selected.unwrap_or_else(|| {
+            panic!("vendor-hash static archive not found for mtmd in {dir:?}");
+        });
         println!(
             "cargo:rustc-link-search=native={}",
             lib.parent().unwrap().display()
         );
-        println!("cargo:rustc-link-lib=static={}", lib_name(lib));
+        println!("cargo:rustc-link-lib=static={}", lib_name(&lib));
     }
 
     // Link libraries
