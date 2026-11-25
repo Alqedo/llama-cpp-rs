@@ -129,6 +129,36 @@ impl LlamaContextParams {
         self.context_params.n_seq_max
     }
 
+    /// Set the maximum number of outputs (logit rows) in a single ubatch (`0` = `n_batch`).
+    ///
+    /// Bounding this to the actual number of simultaneous logit rows needed (for example
+    /// `n_seq_max` when only the final token of each sequence requests logits) avoids reserving
+    /// an `n_ubatch * n_vocab * sizeof(float)` compute buffer during graph allocation.
+    #[must_use]
+    pub fn with_n_outputs_max(mut self, n_outputs_max: u32) -> Self {
+        self.context_params.n_outputs_max = n_outputs_max;
+        self
+    }
+
+    /// Get the maximum number of outputs (logit rows) in a single ubatch (`0` = `n_batch`).
+    #[must_use]
+    pub fn n_outputs_max(&self) -> u32 {
+        self.context_params.n_outputs_max
+    }
+
+    /// Set the maximum number of outputs (logit rows) per sequence (`0` = `n_outputs_max`).
+    #[must_use]
+    pub fn with_n_outputs_max_per_seq(mut self, n_outputs_max_per_seq: u32) -> Self {
+        self.context_params.n_outputs_max_per_seq = n_outputs_max_per_seq;
+        self
+    }
+
+    /// Get the maximum number of outputs (logit rows) per sequence (`0` = `n_outputs_max`).
+    #[must_use]
+    pub fn n_outputs_max_per_seq(&self) -> u32 {
+        self.context_params.n_outputs_max_per_seq
+    }
+
     /// Set the number of recurrent-state rollback snapshots per sequence.
     ///
     /// MTP speculative decoding uses this on the target context so llama.cpp can
