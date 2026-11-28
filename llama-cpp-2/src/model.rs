@@ -365,6 +365,43 @@ impl LlamaModel {
         Ok(LlamaModel { model })
     }
 
+    /// Loads a model from a seekable GGUF reader.
+    ///
+    /// # Errors
+    /// Returns an error if the native loader rejects the source or is cancelled.
+    ///
+    /// # Safety
+    /// The reader callback and optional tensor file must satisfy the native source contract
+    /// and remain valid throughout this synchronous call. The callback must not unwind.
+    pub unsafe fn load_from_reader(
+        _: &LlamaBackend,
+        source: llama_cpp_sys_2::llama_gguf_source,
+        params: &LlamaModelParams,
+    ) -> Result<Self, LlamaModelLoadError> {
+        let model = unsafe { llama_cpp_sys_2::llama_model_load_from_reader(source, params.params) };
+        let model = Ptr::new(model).ok_or(LlamaModelLoadError::NullResult)?;
+        Ok(Self { model })
+    }
+
+    /// Initializes a LoRA adapter from a seekable GGUF reader.
+    ///
+    /// # Errors
+    /// Returns an error if the native loader cannot read or apply the adapter.
+    ///
+    /// # Safety
+    /// The reader callback and userdata must remain valid throughout this synchronous call.
+    /// The callback must not unwind. The optional tensor file must be null for adapters.
+    pub unsafe fn lora_adapter_init_from_reader(
+        &mut self,
+        source: llama_cpp_sys_2::llama_gguf_source,
+    ) -> Result<LlamaLoraAdapter, LlamaLoraAdapterInitError> {
+        let handle = unsafe {
+            llama_cpp_sys_2::llama_adapter_lora_init_from_reader(self.model.as_mut_ptr(), source)
+        };
+        let lora_adapter = Ptr::new(handle).ok_or(LlamaLoraAdapterInitError::NullResult)?;
+        Ok(LlamaLoraAdapter { lora_adapter })
+    }
+
     /// Initializes a lora adapter from a file.
     ///
     /// # Errors

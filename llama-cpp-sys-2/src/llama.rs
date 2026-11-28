@@ -414,6 +414,21 @@ extern "C" {
         params: llama_model_params,
     ) -> *mut llama_model;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct llama_gguf_source {
+    pub read_at: gguf_reader_callback_t,
+    pub userdata: *mut ::std::os::raw::c_void,
+    pub size: u64,
+    pub tensor_file: *mut FILE,
+    pub tensor_file_offset: u64,
+}
+extern "C" {
+    pub fn llama_model_load_from_reader(
+        source: llama_gguf_source,
+        params: llama_model_params,
+    ) -> *mut llama_model;
+}
 extern "C" {
     pub fn llama_model_load_from_splits(
         paths: *mut *const ::std::os::raw::c_char,
@@ -653,6 +668,12 @@ extern "C" {
     pub fn llama_adapter_lora_init_from_file_ptr(
         model: *mut llama_model,
         file: *mut FILE,
+    ) -> *mut llama_adapter_lora;
+}
+extern "C" {
+    pub fn llama_adapter_lora_init_from_reader(
+        model: *mut llama_model,
+        source: llama_gguf_source,
     ) -> *mut llama_adapter_lora;
 }
 extern "C" {
